@@ -1,5 +1,6 @@
 import express from 'express';
 import OpenAI from 'openai';
+import fetch from 'node-fetch'; // Polyfill fetch for Node environment
 
 const app = express();
 app.use(express.json());
