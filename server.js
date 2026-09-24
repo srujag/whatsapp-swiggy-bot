@@ -1,106 +1,194 @@
 import express from 'express';
-import OpenAI from 'openai';
-import fetch from 'node-fetch'; // Polyfill fetch for Node environment
 
 const app = express();
 app.use(express.json());
 
-const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+// Top-level crash prevention guardrails
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// Helper: Call Swiggy MCP Streamable HTTP endpoint directly
-async function callSwiggyMcp(method, params = {}, token = null) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+// 1. GET /webhook -> Meta Verification Handshake
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
+    console.log('✅ Webhook verified successfully!');
+    return res.status(200).send(challenge);
   }
+  return res.sendStatus(403);
+});
 
-  const response = await fetch('https://mcp.swiggy.com/food', {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: method,
-      params: params
-    })
-  });
+// 2. POST /webhook -> Process WhatsApp Incoming Messages
+app.post('/webhook', async (req, res) => {
+  // Acknowledge Meta immediately with 200 OK
+  res.sendStatus(200);
 
-  if (!response.ok) {
-    throw new Error(`Swiggy MCP HTTP ${response.status}: ${response.statusText}`);
+  try {
+    const body = req.body;
+    if (body.object === 'whatsapp_business_account') {
+      const value = body.entry?.[0]?.changes?.[0]?.value;
+      if (value?.messages?.[0]) {
+        const from = value.messages[0].from;
+        const text = value.messages[0].text?.body;
+
+        console.log(`📩 Incoming message from ${from}: "${text}"`);
+
+        if (text) {
+          const reply = await processWithOpenAIAndSwiggy(text);
+          await sendWhatsAppMessage(from, reply);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Webhook error:', error);
   }
+});
 
-  const data = await response.json();
-  if (data.error) {
-    throw new Error(`Swiggy MCP RPC Error: ${data.error.message}`);
-  }
-
-  return data.result;
-}
-
-async function handleUserQuery(userMessage, userToken = null) {
-  if (!openai) {
-    return "OpenAI API Key is missing in environment variables.";
+// Helper: Handles Swiggy MCP via direct JSON-RPC POST call & OpenAI
+async function processWithOpenAIAndSwiggy(userMessage) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return "OpenAI API Key is missing in Render environment variables.";
   }
 
   try {
-    // 1. Fetch tool catalogue via JSON-RPC POST request
-    const toolsResult = await callSwiggyMcp('tools/list', {}, userToken);
-    const tools = toolsResult?.tools || [];
+    // 1. Call Swiggy MCP Endpoint (JSON-RPC) using global fetch
+    let tools = [];
+    try {
+      const mcpRes = await fetch('https://mcp.swiggy.com/food', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now(),
+          method: 'tools/list',
+          params: {}
+        })
+      });
 
-    const formattedTools = tools.map(t => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.inputSchema
+      if (mcpRes.ok) {
+        const mcpData = await mcpRes.json();
+        tools = (mcpData.result?.tools || []).map(t => ({
+          type: 'function',
+          function: {
+            name: t.name,
+            description: t.description,
+            parameters: t.inputSchema
+          }
+        }));
       }
-    }));
+    } catch (mcpErr) {
+      console.warn('⚠️ Swiggy MCP fetch failed, continuing without tools:', mcpErr.message);
+    }
 
-    // 2. Pass prompt and available tools to GPT-4o
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: 'You are a helpful Swiggy food ordering assistant on WhatsApp.' },
-        { role: 'user', content: userMessage }
-      ],
-      tools: formattedTools.length > 0 ? formattedTools : undefined
+    // 2. Send request to OpenAI API directly
+    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: 'You are a helpful Swiggy food ordering assistant on WhatsApp.' },
+          { role: 'user', content: userMessage }
+        ],
+        tools: tools.length > 0 ? tools : undefined
+      })
     });
 
-    const responseMessage = completion.choices[0].message;
+    const aiData = await openaiRes.json();
+    if (aiData.error) {
+      throw new Error(`OpenAI API error: ${aiData.error.message}`);
+    }
 
-    // 3. Execute tool if requested by OpenAI
+    const responseMessage = aiData.choices[0].message;
+
+    // Handle Tool Execution if OpenAI wants to call a Swiggy tool
     if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       console.log(`🛠️ Executing Swiggy Tool: ${toolCall.function.name}`);
 
-      const toolResult = await callSwiggyMcp('tools/call', {
-        name: toolCall.function.name,
-        arguments: JSON.parse(toolCall.function.arguments)
-      }, userToken);
-
-      const secondCompletion = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          { role: 'user', content: userMessage },
-          responseMessage,
-          { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
-        ]
+      const toolExecRes = await fetch('https://mcp.swiggy.com/food', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now(),
+          method: 'tools/call',
+          params: {
+            name: toolCall.function.name,
+            arguments: JSON.parse(toolCall.function.arguments)
+          }
+        })
       });
 
-      return secondCompletion.choices[0].message.content;
+      const toolResult = await toolExecRes.json();
+
+      const secondAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          messages: [
+            { role: 'user', content: userMessage },
+            responseMessage,
+            { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
+          ]
+        })
+      });
+
+      const secondAiData = await secondAiRes.json();
+      return secondAiData.choices[0].message.content;
     }
 
     return responseMessage.content;
   } catch (err) {
-    console.error('⚠️ Swiggy MCP Execution Error:', err.message);
-    
-    // Fallback response if Swiggy OAuth is required
-    if (err.message.includes('401') || err.message.includes('Unauthorized')) {
-      return `To search restaurants or order on Swiggy, please log in first: https://mcp.swiggy.com/auth/authorize`;
-    }
+    console.error('⚠️ Processing error:', err.message);
+    return `Got your message: "${userMessage}". (Server note: ${err.message})`;
+  }
+}
+
+// Helper: Send WhatsApp Reply via Meta Graph API
+async function sendWhatsAppMessage(to, messageText) {
+  const phoneId = process.env.PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+
+  if (!phoneId || !token) {
+    console.error('❌ PHONE_NUMBER_ID or WHATSAPP_TOKEN environment variables missing.');
+    return;
+  }
+
+  try {
+    const res = await fetch(`https://graph.facebook.com/v20.0/${phoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'text',
+        text: { body: messageText }
+      }),
+    });
+    const data = await res.json();
+    console.log('📤 WhatsApp Outbound Status:', data);
+  } catch (err) {
+    console.error('❌ Failed to send WhatsApp message:', err);
+  }
+}
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 Webhook server active on port ${PORT}`));
     
     return `Got your message: "${userMessage}". (Swiggy response: ${err.message})`;
   }
