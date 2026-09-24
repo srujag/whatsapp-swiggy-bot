@@ -3,11 +3,11 @@ import express from 'express';
 const app = express();
 app.use(express.json());
 
-// Top-level crash prevention guardrails
+// Global crash handlers
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// 1. GET /webhook -> Meta Verification Handshake
+// 1. GET /webhook -> Verification Handshake for Meta
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -15,14 +15,14 @@ app.get('/webhook', (req, res) => {
 
   if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
     console.log('✅ Webhook verified successfully!');
-    return res.status(200).send(challenge);
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
   }
-  return res.sendStatus(403);
 });
 
-// 2. POST /webhook -> Process WhatsApp Incoming Messages
+// 2. POST /webhook -> Incoming Messages from WhatsApp
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Meta immediately with 200 OK
   res.sendStatus(200);
 
   try {
@@ -42,11 +42,11 @@ app.post('/webhook', async (req, res) => {
       }
     }
   } catch (error) {
-    console.error('❌ Webhook error:', error);
+    console.error('❌ Webhook processing error:', error);
   }
 });
 
-// Helper: Handles Swiggy MCP via direct JSON-RPC POST call & OpenAI
+// Helper: Handle Swiggy MCP via JSON-RPC POST call & OpenAI
 async function processWithOpenAIAndSwiggy(userMessage) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -54,7 +54,6 @@ async function processWithOpenAIAndSwiggy(userMessage) {
   }
 
   try {
-    // 1. Call Swiggy MCP Endpoint (JSON-RPC) using global fetch
     let tools = [];
     try {
       const mcpRes = await fetch('https://mcp.swiggy.com/food', {
@@ -80,10 +79,9 @@ async function processWithOpenAIAndSwiggy(userMessage) {
         }));
       }
     } catch (mcpErr) {
-      console.warn('⚠️ Swiggy MCP fetch failed, continuing without tools:', mcpErr.message);
+      console.warn('⚠️ Swiggy MCP fetch failed, skipping tools:', mcpErr.message);
     }
 
-    // 2. Send request to OpenAI API directly
     const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -107,7 +105,6 @@ async function processWithOpenAIAndSwiggy(userMessage) {
 
     const responseMessage = aiData.choices[0].message;
 
-    // Handle Tool Execution if OpenAI wants to call a Swiggy tool
     if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       console.log(`🛠️ Executing Swiggy Tool: ${toolCall.function.name}`);
@@ -151,7 +148,7 @@ async function processWithOpenAIAndSwiggy(userMessage) {
     return responseMessage.content;
   } catch (err) {
     console.error('⚠️ Processing error:', err.message);
-    return `Got your message: "${userMessage}". (Server note: ${err.message})`;
+    return `Got your message: "${userMessage}". (Note: ${err.message})`;
   }
 }
 
@@ -161,7 +158,7 @@ async function sendWhatsAppMessage(to, messageText) {
   const token = process.env.WHATSAPP_TOKEN;
 
   if (!phoneId || !token) {
-    console.error('❌ PHONE_NUMBER_ID or WHATSAPP_TOKEN environment variables missing.');
+    console.error('❌ PHONE_NUMBER_ID or WHATSAPP_TOKEN missing.');
     return;
   }
 
@@ -189,7 +186,3 @@ async function sendWhatsAppMessage(to, messageText) {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 Webhook server active on port ${PORT}`));
-    
-    return `Got your message: "${userMessage}". (Swiggy response: ${err.message})`;
-  }
-}
