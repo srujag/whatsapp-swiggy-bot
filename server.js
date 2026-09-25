@@ -24,29 +24,43 @@ function generatePKCE() {
 }
 
 /**
- * OpenAI Tool Definitions matching Swiggy MCP Server Schema
+ * Official Swiggy MCP Tool Definitions
  */
 const SWIGGY_FOOD_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'get_addresses',
-      description: 'Fetch saved delivery addresses for the logged-in Swiggy account.',
+      description: 'Fetch saved delivery addresses for the logged-in Swiggy user.',
       parameters: { type: 'object', properties: {} }
     }
   },
   {
     type: 'function',
     function: {
-      name: 'search_restaurants',
-      description: 'Search Swiggy for restaurants and dishes based on query and area location.',
+      name: 'create_address',
+      description: 'Create and save a new delivery address for the user on Swiggy.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Dish name, e.g., Chicken Biryani, Dessert, Pizza' },
-          location: { type: 'string', description: 'Neighborhood, area, or full address, e.g. Kondapur, Hyderabad' }
+          address: { type: 'string', description: 'Full address or neighborhood provided by user (e.g., Kondapur, Hyderabad)' }
         },
-        required: ['query', 'location']
+        required: ['address']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_restaurants',
+      description: 'Search Swiggy for restaurants and dishes using addressId.',
+      parameters: {
+        type: 'object',
+        properties: {
+          addressId: { type: 'string', description: 'REQUIRED addressId obtained from get_addresses or create_address' },
+          query: { type: 'string', description: 'Dish or restaurant search query (e.g., chicken biryani)' }
+        },
+        required: ['addressId', 'query']
       }
     }
   },
@@ -58,9 +72,9 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          restaurant_id: { type: 'string', description: 'Swiggy Restaurant ID' }
+          restaurantId: { type: 'string', description: 'Swiggy Restaurant ID' }
         },
-        required: ['restaurant_id']
+        required: ['restaurantId']
       }
     }
   },
@@ -72,11 +86,11 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          restaurant_id: { type: 'string', description: 'Swiggy Restaurant ID' },
-          item_id: { type: 'string', description: 'Item ID to add' },
+          restaurantId: { type: 'string', description: 'Swiggy Restaurant ID' },
+          menu_item_id: { type: 'string', description: 'Item ID to add' },
           quantity: { type: 'number', description: 'Quantity (default 1)' }
         },
-        required: ['restaurant_id', 'item_id']
+        required: ['restaurantId', 'menu_item_id']
       }
     }
   },
@@ -84,7 +98,7 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'get_food_cart',
-      description: 'Fetch current cart items, delivery charges, and final bill amount.',
+      description: 'Fetch current cart contents, bill breakdown, and delivery charges.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -96,10 +110,10 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          address: { type: 'string', description: 'Delivery address text or address ID' },
-          payment_method: { type: 'string', description: 'Payment method, set strictly to COD' }
+          addressId: { type: 'string', description: 'Selected address ID for delivery' },
+          payment_method: { type: 'string', description: 'Set strictly to COD' }
         },
-        required: ['payment_method']
+        required: ['addressId', 'payment_method']
       }
     }
   }
@@ -107,17 +121,18 @@ const SWIGGY_FOOD_TOOLS = [
 
 const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
 
-WORKFLOW INSTRUCTIONS:
-1. When a user asks to view or order food options (e.g., "I want chicken biryani"):
-   - Extract the food item and delivery location from their text (e.g. "Kondapur").
-   - Directly call \`search_restaurants\` using their location and query.
-   - Do NOT force \`get_addresses\` if they have already supplied a neighborhood in chat.
-2. Present 3-5 dish options with restaurant name, dish name, price (in INR), and rating.
-3. When the user confirms an option:
-   - Call \`update_food_cart\` to add the item.
-   - Call \`get_food_cart\` to summarize item costs, taxes, delivery fee, and total bill.
-   - Request final user confirmation to place order with Cash on Delivery (COD).
-4. Upon user confirmation, call \`place_food_order\` with payment_method="COD".`;
+CRITICAL INSTRUCTIONS TO PREVENT LOCATION LOOPS:
+1. When a user asks for food (e.g. "chicken biryani order" in "Kondapur"):
+   - Step A: Call \`get_addresses\`.
+   - Step B: If \`get_addresses\` returns an address, pick the first \`addressId\`.
+   - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire a new \`addressId\`.
+   - Step D: Once you have an \`addressId\`, directly call \`search_restaurants(addressId=..., query="chicken biryani")\`.
+   - DO NOT repeatedly ask the user for their location if they already typed an area in chat!
+
+2. Present 3-5 dish options with restaurant name, item name, price, and rating.
+3. Upon user confirmation:
+   - Call \`update_food_cart\` and \`get_food_cart\`.
+   - Request final user confirmation to place order via Cash on Delivery (COD).`;
 
 /**
  * Execute JSON-RPC 2.0 calls to Swiggy MCP Server with Initialization
@@ -128,9 +143,8 @@ async function callSwiggyMCP(toolName, args, token) {
     'Authorization': `Bearer ${token}`
   };
 
-  // Step 1: Execute JSON-RPC 'initialize' handshake
   try {
-    const initRes = await fetch(SWIGGY_MCP_ENDPOINT, {
+    await fetch(SWIGGY_MCP_ENDPOINT, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -144,15 +158,10 @@ async function callSwiggyMCP(toolName, args, token) {
         }
       })
     });
-
-    if (!initRes.ok) {
-      console.warn(`⚠️ MCP initialize returned status ${initRes.status}`);
-    }
   } catch (err) {
-    console.warn(`⚠️ MCP initialize handshake failed: ${err.message}`);
+    console.warn(`⚠️ MCP initialize handshake warning: ${err.message}`);
   }
 
-  // Step 2: Execute JSON-RPC 'tools/call'
   const mcpRes = await fetch(SWIGGY_MCP_ENDPOINT, {
     method: 'POST',
     headers,
@@ -171,7 +180,7 @@ async function callSwiggyMCP(toolName, args, token) {
 
   if (!mcpRes.ok || mcpData.error) {
     console.error(`❌ MCP Tool Call Failed [${toolName}]:`, JSON.stringify(mcpData));
-    throw new Error(mcpData.error?.message || `Swiggy server returned HTTP ${mcpRes.status}`);
+    return { success: false, error: mcpData.error?.message || `Error status ${mcpRes.status}` };
   }
 
   return mcpData.result || mcpData;
@@ -230,7 +239,7 @@ async function handleUserCodeSubmission(from, input) {
 
     const codeVerifier = pkceStore.get(from);
     if (!codeVerifier) {
-      await sendWhatsAppMessage(from, "⚠️ Session expired. Please send your food order again to receive a fresh login link.");
+      await sendWhatsAppMessage(from, "⚠️ Session expired. Please send your food order again to generate a new login link.");
       return;
     }
 
@@ -253,7 +262,7 @@ async function handleUserCodeSubmission(from, input) {
       pkceStore.delete(from);
 
       console.log(`🔑 Token acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Please re-send your food request (e.g., 'Chicken Biryani in Kondapur').");
+      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Please ask for your dish again (e.g. 'Chicken Biryani in Kondapur').");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
@@ -289,7 +298,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
     const aiData = await openaiRes.json();
 
-    // Guard against undefined choices (prevents crash)
     if (!aiData.choices || aiData.choices.length === 0) {
       console.error('❌ OpenAI invalid response:', JSON.stringify(aiData));
       return "I encountered a temporary issue processing your request. Please try again.";
@@ -297,7 +305,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
     let responseMessage = aiData.choices[0].message;
 
-    // Process tool calls iteratively
     while (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       const toolName = toolCall.function.name;
@@ -315,13 +322,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
       }
 
-      let toolResult;
-      try {
-        toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
-      } catch (err) {
-        console.error(`❌ Tool execution error [${toolName}]:`, err.message);
-        toolResult = { error: `Failed to execute ${toolName}: ${err.message}` };
-      }
+      const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
 
       const followUpRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
