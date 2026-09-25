@@ -4,6 +4,7 @@ import crypto from 'crypto';
 const app = express();
 app.use(express.json());
 
+// Prevent unhandled errors from crashing the node process
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
@@ -31,11 +32,12 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'search_restaurants',
-      description: 'Search for restaurants, biryani, pizza, or food items available on Swiggy.',
+      description: 'Search Swiggy for available dishes, restaurants, biryani, or pizzas.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Dish name or cuisine type, e.g. Biryani' }
+          query: { type: 'string', description: 'Dish name or cuisine type, e.g. Biryani' },
+          location: { type: 'string', description: 'User delivery city or neighborhood area' }
         },
         required: ['query']
       }
@@ -94,8 +96,8 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Incoming message from ${from}: "${text}"`);
 
         if (text) {
-          // If the user pastes back a URL containing the auth code or raw code
-          if (text.includes('code=') || text.startsWith('AUTH_CODE_')) {
+          // Check if user pasted a redirect URL or authorization code
+          if (text.includes('code=') || text.includes('localhost/callback')) {
             await handleUserCodeSubmission(from, text);
           } else {
             const userAuthToken = userTokens.get(from) || null;
@@ -115,13 +117,14 @@ async function handleUserCodeSubmission(from, input) {
   try {
     let authCode = input.trim();
     if (input.includes('code=')) {
-      const urlObj = new URL(input.startsWith('http') ? input : `http://${input}`);
+      const urlString = input.startsWith('http') ? input : `http://${input}`;
+      const urlObj = new URL(urlString);
       authCode = urlObj.searchParams.get('code');
     }
 
     const codeVerifier = pkceStore.get(from);
     if (!codeVerifier) {
-      await sendWhatsAppMessage(from, "⚠️ Session expired. Please request food again to generate a new login link.");
+      await sendWhatsAppMessage(from, "⚠️ Session expired. Please request your food search again to generate a new login link.");
       return;
     }
 
@@ -144,13 +147,13 @@ async function handleUserCodeSubmission(from, input) {
       pkceStore.delete(from);
 
       console.log(`🔑 Token successfully acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! What would you like to order today?");
+      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Re-send your food item order or search to view options.");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
   } catch (err) {
     console.error('❌ Token Exchange Error:', err.message);
-    await sendWhatsAppMessage(from, `❌ Authentication failed: ${err.message}. Please try copying the code/URL again.`);
+    await sendWhatsAppMessage(from, `❌ Authentication failed: ${err.message}. Please copy the entire browser URL and paste it again.`);
   }
 }
 
@@ -172,11 +175,12 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         messages: [
           { 
             role: 'system', 
-            content: 'You are an official Swiggy assistant on WhatsApp. Use Swiggy tools whenever users ask for food, menus, prices, or orders.' 
+            content: 'You are an active Swiggy ordering assistant on WhatsApp. NEVER instruct users to open the Swiggy website or mobile app. ALWAYS invoke available Swiggy tools (like search_restaurants) to fetch live items and menus directly.' 
           },
           { role: 'user', content: userMessage }
         ],
-        tools: SWIGGY_FOOD_TOOLS
+        tools: SWIGGY_FOOD_TOOLS,
+        tool_choice: 'auto'
       })
     });
 
@@ -185,6 +189,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
     const responseMessage = aiData.choices[0].message;
 
+    // Check if AI requested a tool execution
     if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       console.log(`🛠️ OpenAI requested Swiggy Tool: ${toolCall.function.name}`);
@@ -196,9 +201,10 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
         const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
 
-        return `🔒 Connect your Swiggy account:\n\n1. Open this link: ${authUrl}\n2. Login on Swiggy.\n3. Copy the full address/URL from your browser bar (it will start with http://localhost/callback...) and paste it back here!`;
+        return `🔒 Connect your Swiggy account to search menu items:\n\n1. Open link: ${authUrl}\n2. Sign in to Swiggy.\n3. Copy the full address/URL from your browser bar (it starts with http://localhost/callback...) and paste it directly into this chat!`;
       }
 
+      // Call Swiggy MCP Tool Endpoint
       const mcpRes = await fetch('https://mcp.swiggy.com/food', {
         method: 'POST',
         headers: {
@@ -218,6 +224,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
       const toolResult = await mcpRes.json();
 
+      // Send tool results back to OpenAI for final response formatting
       const secondAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
