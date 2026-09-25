@@ -7,11 +7,12 @@ app.use(express.json());
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// Stores for Tokens and PKCE Verifiers
+// In-memory stores for user tokens and PKCE state
 const userTokens = new Map();
 const pkceStore = new Map();
 
-const RENDER_BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://whatsapp-swiggy-bot.onrender.com';
+// Swiggy Whitelisted Localhost Redirect URI
+const SWIGGY_REDIRECT_URI = 'http://localhost/callback';
 
 // Helper: Generate OAuth 2.1 PKCE Challenge Pair (S256)
 function generatePKCE() {
@@ -78,54 +79,7 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// 2. GET /auth/callback -> Swiggy OAuth Redirect & PKCE Token Exchange
-app.get('/auth/callback', async (req, res) => {
-  const { code, state: phone } = req.query;
-
-  if (!code || !phone) {
-    return res.status(400).send('❌ Invalid response: Missing authorization code or user phone state.');
-  }
-
-  try {
-    const codeVerifier = pkceStore.get(phone);
-
-    const tokenRes = await fetch('https://mcp.swiggy.com/auth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        client_id: 'whatsapp_bot',
-        code: code,
-        redirect_uri: `${RENDER_BASE_URL}/auth/callback`,
-        code_verifier: codeVerifier
-      })
-    });
-
-    const tokenData = await tokenRes.json();
-
-    if (tokenData.access_token) {
-      userTokens.set(phone, tokenData.access_token);
-      pkceStore.delete(phone);
-
-      console.log(`🔑 Token stored for ${phone}`);
-      await sendWhatsAppMessage(phone, "🎉 Authenticated successfully with Swiggy! What would you like to order today?");
-
-      res.send(`
-        <div style="text-align: center; font-family: sans-serif; padding-top: 50px;">
-          <h2>✅ Authentication Successful!</h2>
-          <p>Your account is connected. You can close this window and return to WhatsApp.</p>
-        </div>
-      `);
-    } else {
-      throw new Error(tokenData.error_description || 'Token exchange failed.');
-    }
-  } catch (err) {
-    console.error('❌ OAuth callback error:', err);
-    res.status(500).send(`Authentication failed: ${err.message}`);
-  }
-});
-
-// 3. POST /webhook -> Process Incoming Messages
+// 2. POST /webhook -> Process Incoming WhatsApp Messages
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -140,9 +94,14 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Incoming message from ${from}: "${text}"`);
 
         if (text) {
-          const userAuthToken = userTokens.get(from) || null;
-          const reply = await processWithOpenAIAndSwiggy(from, text, userAuthToken);
-          await sendWhatsAppMessage(from, reply);
+          // If the user pastes back a URL containing the auth code or raw code
+          if (text.includes('code=') || text.startsWith('AUTH_CODE_')) {
+            await handleUserCodeSubmission(from, text);
+          } else {
+            const userAuthToken = userTokens.get(from) || null;
+            const reply = await processWithOpenAIAndSwiggy(from, text, userAuthToken);
+            await sendWhatsAppMessage(from, reply);
+          }
         }
       }
     }
@@ -150,6 +109,50 @@ app.post('/webhook', async (req, res) => {
     console.error('❌ Webhook processing error:', error);
   }
 });
+
+// Exchange Authorization Code pasted by the user
+async function handleUserCodeSubmission(from, input) {
+  try {
+    let authCode = input.trim();
+    if (input.includes('code=')) {
+      const urlObj = new URL(input.startsWith('http') ? input : `http://${input}`);
+      authCode = urlObj.searchParams.get('code');
+    }
+
+    const codeVerifier = pkceStore.get(from);
+    if (!codeVerifier) {
+      await sendWhatsAppMessage(from, "⚠️ Session expired. Please request food again to generate a new login link.");
+      return;
+    }
+
+    const tokenRes = await fetch('https://mcp.swiggy.com/auth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: 'whatsapp_bot',
+        code: authCode,
+        redirect_uri: SWIGGY_REDIRECT_URI,
+        code_verifier: codeVerifier
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (tokenData.access_token) {
+      userTokens.set(from, tokenData.access_token);
+      pkceStore.delete(from);
+
+      console.log(`🔑 Token successfully acquired for ${from}`);
+      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! What would you like to order today?");
+    } else {
+      throw new Error(tokenData.error_description || 'Token exchange failed.');
+    }
+  } catch (err) {
+    console.error('❌ Token Exchange Error:', err.message);
+    await sendWhatsAppMessage(from, `❌ Authentication failed: ${err.message}. Please try copying the code/URL again.`);
+  }
+}
 
 async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = null) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -190,10 +193,10 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         const { verifier, challenge } = generatePKCE();
         pkceStore.set(from, verifier);
 
-        const redirectUri = encodeURIComponent(`${RENDER_BASE_URL}/auth/callback`);
-        const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${redirectUri}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
+        const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
+        const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
 
-        return `🔒 To search dishes, view menus, or place orders on Swiggy, please connect your account:\n\n👉 ${authUrl}`;
+        return `🔒 Connect your Swiggy account:\n\n1. Open this link: ${authUrl}\n2. Login on Swiggy.\n3. Copy the full address/URL from your browser bar (it will start with http://localhost/callback...) and paste it back here!`;
       }
 
       const mcpRes = await fetch('https://mcp.swiggy.com/food', {
