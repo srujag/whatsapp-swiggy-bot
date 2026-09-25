@@ -7,8 +7,11 @@ app.use(express.json());
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// In-memory store for user authentication tokens (Swap with Redis/DB for production)
+// In-memory store for user authentication tokens
 const userTokens = new Map();
+
+// Base URL for your Render app (adjust if your service name is different)
+const RENDER_BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://whatsapp-swiggy-bot.onrender.com';
 
 // Swiggy Core Tools Schema for OpenAI
 const SWIGGY_FOOD_TOOLS = [
@@ -64,7 +67,35 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// 2. POST /webhook -> Process Incoming WhatsApp Messages
+// 2. GET /auth/callback -> Swiggy OAuth Redirect Handling
+app.get('/auth/callback', async (req, res) => {
+  const { code, state: phone } = req.query;
+
+  if (!code || !phone) {
+    return res.status(400).send('❌ Invalid response: Missing authorization code or user phone state.');
+  }
+
+  try {
+    // Store token/code associated with user's WhatsApp number
+    userTokens.set(phone, code);
+    console.log(`🔑 Saved auth token for ${phone}`);
+
+    // Notify user on WhatsApp that authentication succeeded
+    await sendWhatsAppMessage(phone, "🎉 Authenticated successfully with Swiggy! What would you like to order today?");
+
+    res.send(`
+      <div style="text-align: center; font-family: sans-serif; padding-top: 50px;">
+        <h2>✅ Authentication Successful!</h2>
+        <p>Your account is connected. You can close this window and return to WhatsApp.</p>
+      </div>
+    `);
+  } catch (err) {
+    console.error('❌ OAuth callback error:', err);
+    res.status(500).send('Authentication processing failed.');
+  }
+});
+
+// 3. POST /webhook -> Process Incoming WhatsApp Messages
 app.post('/webhook', async (req, res) => {
   // Acknowledge Meta immediately to prevent retry drops or timeouts
   res.sendStatus(200);
@@ -81,7 +112,7 @@ app.post('/webhook', async (req, res) => {
 
         if (text) {
           const userAuthToken = userTokens.get(from) || null;
-          const reply = await processWithOpenAIAndSwiggy(text, userAuthToken);
+          const reply = await processWithOpenAIAndSwiggy(from, text, userAuthToken);
           await sendWhatsAppMessage(from, reply);
         }
       }
@@ -92,7 +123,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Helper: Handles OpenAI Prompt Execution & Swiggy Tool Calls
-async function processWithOpenAIAndSwiggy(userMessage, userAuthToken = null) {
+async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = null) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return "OpenAI API Key is missing in Render environment variables.";
@@ -129,9 +160,14 @@ async function processWithOpenAIAndSwiggy(userMessage, userAuthToken = null) {
       const toolCall = responseMessage.tool_calls[0];
       console.log(`🛠️ OpenAI requested Swiggy Tool: ${toolCall.function.name}`);
 
-      // Check if user is authenticated with Swiggy
+      // Generate fully encoded OAuth URL with required redirect_uri & state
+      const redirectUri = encodeURIComponent(`${RENDER_BASE_URL}/auth/callback`);
+      const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${redirectUri}&state=${from}`;
+
+      // Prompt user for authentication if no token exists
+      // Note: Swap comment to test MCP with mock token during local sandbox development:
+      // const activeToken = userAuthToken || "MOCK_DEVELOPMENT_TOKEN";
       if (!userAuthToken) {
-        const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&scope=mcp:tools`;
         return `🔒 To search dishes, view menus, or place orders on Swiggy, please connect your account:\n\n👉 ${authUrl}`;
       }
 
