@@ -3,11 +3,54 @@ import express from 'express';
 const app = express();
 app.use(express.json());
 
-// Global crash handlers
+// Prevent unhandled errors from bringing down the node process
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// 1. GET /webhook -> Verification Handshake for Meta
+// In-memory store for user authentication tokens (Swap with Redis/DB for production)
+const userTokens = new Map();
+
+// Swiggy Core Tools Schema for OpenAI
+const SWIGGY_FOOD_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'search_restaurants',
+      description: 'Search for restaurants, biryani, pizza, or food items available on Swiggy.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Dish name or cuisine type, e.g. Biryani' }
+        },
+        required: ['query']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_restaurant_menu',
+      description: 'Get menu items and pricing for a specific restaurant on Swiggy.',
+      parameters: {
+        type: 'object',
+        properties: {
+          restaurant_id: { type: 'string', description: 'Restaurant ID' }
+        },
+        required: ['restaurant_id']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_addresses',
+      description: 'Fetch saved delivery addresses for the logged-in Swiggy user.',
+      parameters: { type: 'object', properties: {} }
+    }
+  }
+];
+
+// 1. GET /webhook -> Meta Webhook Verification Handshake
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -21,8 +64,9 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// 2. POST /webhook -> Incoming Messages from WhatsApp
+// 2. POST /webhook -> Process Incoming WhatsApp Messages
 app.post('/webhook', async (req, res) => {
+  // Acknowledge Meta immediately to prevent retry drops or timeouts
   res.sendStatus(200);
 
   try {
@@ -36,7 +80,8 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Incoming message from ${from}: "${text}"`);
 
         if (text) {
-          const reply = await processWithOpenAIAndSwiggy(text);
+          const userAuthToken = userTokens.get(from) || null;
+          const reply = await processWithOpenAIAndSwiggy(text, userAuthToken);
           await sendWhatsAppMessage(from, reply);
         }
       }
@@ -46,42 +91,15 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Helper: Handle Swiggy MCP via JSON-RPC POST call & OpenAI
-async function processWithOpenAIAndSwiggy(userMessage) {
+// Helper: Handles OpenAI Prompt Execution & Swiggy Tool Calls
+async function processWithOpenAIAndSwiggy(userMessage, userAuthToken = null) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return "OpenAI API Key is missing in Render environment variables.";
   }
 
   try {
-    let tools = [];
-    try {
-      const mcpRes = await fetch('https://mcp.swiggy.com/food', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method: 'tools/list',
-          params: {}
-        })
-      });
-
-      if (mcpRes.ok) {
-        const mcpData = await mcpRes.json();
-        tools = (mcpData.result?.tools || []).map(t => ({
-          type: 'function',
-          function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.inputSchema
-          }
-        }));
-      }
-    } catch (mcpErr) {
-      console.warn('⚠️ Swiggy MCP fetch failed, skipping tools:', mcpErr.message);
-    }
-
+    // 1. Send query and Swiggy tools schema to OpenAI
     const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -91,27 +109,39 @@ async function processWithOpenAIAndSwiggy(userMessage) {
       body: JSON.stringify({
         model: 'gpt-4o',
         messages: [
-          { role: 'system', content: 'You are a helpful Swiggy food ordering assistant on WhatsApp.' },
+          { 
+            role: 'system', 
+            content: 'You are an official Swiggy assistant on WhatsApp. Use Swiggy tools whenever users ask for food, menus, prices, or orders.' 
+          },
           { role: 'user', content: userMessage }
         ],
-        tools: tools.length > 0 ? tools : undefined
+        tools: SWIGGY_FOOD_TOOLS
       })
     });
 
     const aiData = await openaiRes.json();
-    if (aiData.error) {
-      throw new Error(`OpenAI API error: ${aiData.error.message}`);
-    }
+    if (aiData.error) throw new Error(aiData.error.message);
 
     const responseMessage = aiData.choices[0].message;
 
+    // 2. If OpenAI decides to call a Swiggy Tool
     if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
-      console.log(`🛠️ Executing Swiggy Tool: ${toolCall.function.name}`);
+      console.log(`🛠️ OpenAI requested Swiggy Tool: ${toolCall.function.name}`);
 
-      const toolExecRes = await fetch('https://mcp.swiggy.com/food', {
+      // Check if user is authenticated with Swiggy
+      if (!userAuthToken) {
+        const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&scope=mcp:tools`;
+        return `🔒 To search dishes, view menus, or place orders on Swiggy, please connect your account:\n\n👉 ${authUrl}`;
+      }
+
+      // Execute tool call to Swiggy MCP Endpoint
+      const mcpRes = await fetch('https://mcp.swiggy.com/food', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${userAuthToken}`
+        },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: Date.now(),
@@ -123,8 +153,9 @@ async function processWithOpenAIAndSwiggy(userMessage) {
         })
       });
 
-      const toolResult = await toolExecRes.json();
+      const toolResult = await mcpRes.json();
 
+      // Pass tool result back to OpenAI for natural language response formatting
       const secondAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -152,7 +183,7 @@ async function processWithOpenAIAndSwiggy(userMessage) {
   }
 }
 
-// Helper: Send WhatsApp Reply via Meta Graph API
+// Helper: Outbound WhatsApp Message Sender via Meta Graph API
 async function sendWhatsAppMessage(to, messageText) {
   const phoneId = process.env.PHONE_NUMBER_ID;
   const token = process.env.WHATSAPP_TOKEN;
