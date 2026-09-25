@@ -9,6 +9,8 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:
 
 const userTokens = new Map();
 const pkceStore = new Map();
+// 💡 IN-MEMORY CONVERSATION HISTORY TO PREVENT LOOPS
+const conversationHistory = new Map(); 
 
 const SWIGGY_MCP_ENDPOINT = 'https://mcp.swiggy.com/food';
 const SWIGGY_REDIRECT_URI = 'http://localhost/callback';
@@ -23,15 +25,12 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
-/**
- * Official Swiggy MCP Tool Definitions
- */
 const SWIGGY_FOOD_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'get_addresses',
-      description: 'Fetch saved delivery addresses for the logged-in Swiggy user.',
+      description: 'Get saved delivery addresses for the logged-in Swiggy user.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -39,11 +38,11 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'create_address',
-      description: 'Create and save a new delivery address for the user on Swiggy.',
+      description: 'Create a new delivery address on Swiggy.',
       parameters: {
         type: 'object',
         properties: {
-          address: { type: 'string', description: 'Full address or neighborhood provided by user (e.g., Kondapur, Hyderabad)' }
+          address: { type: 'string', description: 'Address text, neighborhood, or area name (e.g. Kondapur, Hyderabad)' }
         },
         required: ['address']
       }
@@ -53,12 +52,12 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'search_restaurants',
-      description: 'Search Swiggy for restaurants and dishes using addressId.',
+      description: 'Search Swiggy for restaurants and dishes using an addressId.',
       parameters: {
         type: 'object',
         properties: {
-          addressId: { type: 'string', description: 'REQUIRED addressId obtained from get_addresses or create_address' },
-          query: { type: 'string', description: 'Dish or restaurant search query (e.g., chicken biryani)' }
+          addressId: { type: 'string', description: 'Valid addressId from get_addresses or create_address' },
+          query: { type: 'string', description: 'Dish name or cuisine (e.g. chicken biryani)' }
         },
         required: ['addressId', 'query']
       }
@@ -68,7 +67,7 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'get_restaurant_menu',
-      description: 'Get menu items and pricing for a specific restaurant on Swiggy.',
+      description: 'Fetch menu for a specific restaurant ID.',
       parameters: {
         type: 'object',
         properties: {
@@ -82,13 +81,13 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'update_food_cart',
-      description: 'Add or update items in the Swiggy food cart.',
+      description: 'Add or update items in the Swiggy cart.',
       parameters: {
         type: 'object',
         properties: {
           restaurantId: { type: 'string', description: 'Swiggy Restaurant ID' },
           menu_item_id: { type: 'string', description: 'Item ID to add' },
-          quantity: { type: 'number', description: 'Quantity (default 1)' }
+          quantity: { type: 'number', description: 'Quantity' }
         },
         required: ['restaurantId', 'menu_item_id']
       }
@@ -98,7 +97,7 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'get_food_cart',
-      description: 'Fetch current cart contents, bill breakdown, and delivery charges.',
+      description: 'Fetch current cart items and bill summary.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -111,7 +110,7 @@ const SWIGGY_FOOD_TOOLS = [
         type: 'object',
         properties: {
           addressId: { type: 'string', description: 'Selected address ID for delivery' },
-          payment_method: { type: 'string', description: 'Set strictly to COD' }
+          payment_method: { type: 'string', description: 'Must be COD' }
         },
         required: ['addressId', 'payment_method']
       }
@@ -119,24 +118,17 @@ const SWIGGY_FOOD_TOOLS = [
   }
 ];
 
-const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
+const SYSTEM_PROMPT = `You are a Swiggy food ordering assistant on WhatsApp.
 
-CRITICAL INSTRUCTIONS TO PREVENT LOCATION LOOPS:
-1. When a user asks for food (e.g. "chicken biryani order" in "Kondapur"):
-   - Step A: Call \`get_addresses\`.
-   - Step B: If \`get_addresses\` returns an address, pick the first \`addressId\`.
-   - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire a new \`addressId\`.
-   - Step D: Once you have an \`addressId\`, directly call \`search_restaurants(addressId=..., query="chicken biryani")\`.
-   - DO NOT repeatedly ask the user for their location if they already typed an area in chat!
+RULES TO ELIMINATE LOCATION LOOPS:
+1. Whenever the user specifies a dish (e.g., "chicken biryani") and a location (e.g., "Kondapur"):
+   - Call \`get_addresses\`.
+   - If \`get_addresses\` returns valid addresses, use the first addressId.
+   - If \`get_addresses\` returns NO address, immediately call \`create_address(address="Kondapur, Hyderabad")\` to get an addressId.
+   - IMMEDIATELY call \`search_restaurants(addressId=..., query="chicken biryani")\` with the addressId.
+2. NEVER ask the user for their location if they have already provided a neighborhood or area in previous messages!
+3. Format output clearly with top 3-5 dish options (restaurant, item, price in INR, rating).`;
 
-2. Present 3-5 dish options with restaurant name, item name, price, and rating.
-3. Upon user confirmation:
-   - Call \`update_food_cart\` and \`get_food_cart\`.
-   - Request final user confirmation to place order via Cash on Delivery (COD).`;
-
-/**
- * Execute JSON-RPC 2.0 calls to Swiggy MCP Server with Initialization
- */
 async function callSwiggyMCP(toolName, args, token) {
   const headers = {
     'Content-Type': 'application/json',
@@ -239,7 +231,7 @@ async function handleUserCodeSubmission(from, input) {
 
     const codeVerifier = pkceStore.get(from);
     if (!codeVerifier) {
-      await sendWhatsAppMessage(from, "⚠️ Session expired. Please send your food order again to generate a new login link.");
+      await sendWhatsAppMessage(from, "⚠️ Session expired. Please request your order again to generate a new login link.");
       return;
     }
 
@@ -262,7 +254,7 @@ async function handleUserCodeSubmission(from, input) {
       pkceStore.delete(from);
 
       console.log(`🔑 Token acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Please ask for your dish again (e.g. 'Chicken Biryani in Kondapur').");
+      await sendWhatsAppMessage(from, "🎉 Authenticated with Swiggy! Please ask for your food again (e.g., 'Chicken Biryani in Kondapur').");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
@@ -274,57 +266,27 @@ async function handleUserCodeSubmission(from, input) {
 
 async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = null) {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return "OpenAI API Key missing in environment variables.";
+  if (!apiKey) return "OpenAI API Key missing.";
+
+  // Fetch or initialize conversation thread for this user
+  if (!conversationHistory.has(from)) {
+    conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
+  }
+
+  const history = conversationHistory.get(from);
+  history.push({ role: 'user', content: userMessage });
+
+  // Limit thread context to last 15 messages to prevent context overflow
+  if (history.length > 15) {
+    history.splice(1, history.length - 15);
   }
 
   try {
-    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userMessage }
-        ],
-        tools: SWIGGY_FOOD_TOOLS,
-        tool_choice: 'auto'
-      })
-    });
+    let continueLoop = true;
+    let finalReply = "";
 
-    const aiData = await openaiRes.json();
-
-    if (!aiData.choices || aiData.choices.length === 0) {
-      console.error('❌ OpenAI invalid response:', JSON.stringify(aiData));
-      return "I encountered a temporary issue processing your request. Please try again.";
-    }
-
-    let responseMessage = aiData.choices[0].message;
-
-    while (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-      const toolCall = responseMessage.tool_calls[0];
-      const toolName = toolCall.function.name;
-      const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
-
-      console.log(`🛠️ Executing Swiggy Tool: ${toolName}`, toolArgs);
-
-      if (!userAuthToken) {
-        const { verifier, challenge } = generatePKCE();
-        pkceStore.set(from, verifier);
-
-        const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
-        const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
-
-        return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
-      }
-
-      const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
-
-      const followUpRes = await fetch('https://api.openai.com/v1/chat/completions', {
+    while (continueLoop) {
+      const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${apiKey}`,
@@ -332,28 +294,59 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         },
         body: JSON.stringify({
           model: 'gpt-4o',
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: userMessage },
-            responseMessage,
-            { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
-          ],
-          tools: SWIGGY_FOOD_TOOLS
+          messages: history,
+          tools: SWIGGY_FOOD_TOOLS,
+          tool_choice: 'auto'
         })
       });
 
-      const followUpData = await followUpRes.json();
-      if (!followUpData.choices || followUpData.choices.length === 0) {
-        return "I received an unexpected format from the order system. Please try again.";
+      const aiData = await openaiRes.json();
+
+      if (!aiData.choices || aiData.choices.length === 0) {
+        console.error('❌ Invalid response from OpenAI:', JSON.stringify(aiData));
+        return "I encountered an error processing your request. Please try again.";
       }
 
-      responseMessage = followUpData.choices[0].message;
+      const responseMessage = aiData.choices[0].message;
+      history.push(responseMessage); // Add model output to history
+
+      if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+        for (const toolCall of responseMessage.tool_calls) {
+          const toolName = toolCall.function.name;
+          const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+
+          console.log(`🛠️ Calling Swiggy Tool: ${toolName}`, toolArgs);
+
+          if (!userAuthToken) {
+            const { verifier, challenge } = generatePKCE();
+            pkceStore.set(from, verifier);
+
+            const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
+            const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
+
+            return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
+          }
+
+          const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
+
+          // Append tool result to context history
+          history.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(toolResult)
+          });
+        }
+      } else {
+        // No more tool calls required; retrieve text response
+        finalReply = responseMessage.content;
+        continueLoop = false;
+      }
     }
 
-    return responseMessage.content;
+    return finalReply;
   } catch (err) {
     console.error('⚠️ Processing error:', err.message);
-    return `Sorry, I couldn't process that: ${err.message}`;
+    return `Error processing request: ${err.message}`;
   }
 }
 
