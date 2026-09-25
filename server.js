@@ -4,18 +4,14 @@ import crypto from 'crypto';
 const app = express();
 app.use(express.json());
 
-// Prevent unhandled exceptions from crashing node process
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-// In-memory stores for tokens and PKCE state
 const userTokens = new Map();
 const pkceStore = new Map();
 
-// Swiggy Whitelisted Localhost Redirect URI
 const SWIGGY_REDIRECT_URI = 'http://localhost/callback';
 
-// Helper: Generate OAuth 2.1 PKCE Challenge Pair (S256)
 function generatePKCE() {
   const verifier = crypto.randomBytes(32).toString('hex');
   const challenge = crypto
@@ -26,13 +22,12 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
-// Swiggy Full Food MCP Tools Schema for OpenAI
 const SWIGGY_FOOD_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'get_addresses',
-      description: 'Fetch saved delivery addresses for the logged-in Swiggy user sorted by most recent first.',
+      description: 'Fetch saved delivery addresses for the logged-in Swiggy user.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -40,15 +35,14 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'search_restaurants',
-      description: 'Search Swiggy for restaurants, biryani, pizza, or food items based on dish query and address/location.',
+      description: 'Search Swiggy for restaurants and food items based on dish query and address/location.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Dish name or cuisine type, e.g. Chicken Biryani' },
-          address_id: { type: 'string', description: 'Selected Swiggy delivery address ID' },
-          location: { type: 'string', description: 'Fallback location name if address_id is not set' }
+          query: { type: 'string', description: 'Dish name or cuisine, e.g. Chicken Biryani' },
+          location: { type: 'string', description: 'Delivery location or neighborhood, e.g. Kondapur, 500084' }
         },
-        required: ['query']
+        required: ['query', 'location']
       }
     }
   },
@@ -56,7 +50,7 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'get_restaurant_menu',
-      description: 'Get complete menu items and pricing for a specific restaurant on Swiggy.',
+      description: 'Get menu items and pricing for a specific restaurant on Swiggy.',
       parameters: {
         type: 'object',
         properties: {
@@ -86,7 +80,7 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'get_food_cart',
-      description: 'Fetch current cart contents, bill breakdown, and item summary.',
+      description: 'Fetch current cart contents and total price summary.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -98,33 +92,27 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          address_id: { type: 'string', description: 'Selected Swiggy delivery address ID' },
+          address: { type: 'string', description: 'Delivery address text or ID' },
           payment_method: { type: 'string', description: 'Payment method, set to COD' }
         },
-        required: ['address_id', 'payment_method']
+        required: ['payment_method']
       }
     }
   }
 ];
 
-// System Prompt for OpenAI to enforce strict flow
-const SYSTEM_PROMPT = `You are an official Swiggy assistant on WhatsApp capable of end-to-end ordering.
+const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
 
 CRITICAL WORKFLOW RULES:
-1. NEVER ask the user to manually type their delivery location or open the Swiggy website/app.
-2. When a user asks for food (e.g., "I want to order chicken biryani"):
-   - FIRST execute \`get_addresses\` to retrieve their saved Swiggy addresses.
-   - If multiple addresses exist and user hasn't specified, list the addresses clearly and ask them to pick one, or default to the most recent saved address.
-   - Use that saved address/location to search restaurants using \`search_restaurants\`.
-3. Display clear food options with dish name, price, restaurant name, and ratings.
-4. When the user selects an item:
-   - Call \`update_food_cart\` to add the item.
-   - Call \`get_food_cart\` to get the final bill breakdown.
-   - Show the summary (Items, Address, Total Bill, Cash on Delivery) and explicitly ask for confirmation (e.g. "Reply YES to place order via COD").
-5. Upon user confirmation:
-   - Execute \`place_food_order\` with \`payment_method: "COD"\`.`;
+1. When a user asks to order food:
+   - Call \`get_addresses\` to fetch their saved addresses.
+   - IF \`get_addresses\` returns an error or no saved address, DO NOT repeatedly ask them to check their account. Use the location text provided in the user's chat (e.g., "Kondapur") and directly call \`search_restaurants\`.
+2. Present 3-5 clear dish options including restaurant name, item name, price, and rating.
+3. When the user picks an option:
+   - Add it to cart using \`update_food_cart\`.
+   - Call \`get_food_cart\` and present the final total bill with Cash on Delivery (COD).
+   - Ask for confirmation before calling \`place_food_order\`.`;
 
-// 1. GET /webhook -> Meta Webhook Handshake
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -138,7 +126,6 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// 2. POST /webhook -> Process Incoming WhatsApp Messages
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -168,7 +155,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Exchange Authorization Code pasted by the user
 async function handleUserCodeSubmission(from, input) {
   try {
     let authCode = input.trim();
@@ -180,7 +166,7 @@ async function handleUserCodeSubmission(from, input) {
 
     const codeVerifier = pkceStore.get(from);
     if (!codeVerifier) {
-      await sendWhatsAppMessage(from, "⚠️ Session expired. Please ask for your dish again to generate a new authorization link.");
+      await sendWhatsAppMessage(from, "⚠️ Session expired. Please ask for your dish again to generate a new login link.");
       return;
     }
 
@@ -203,7 +189,7 @@ async function handleUserCodeSubmission(from, input) {
       pkceStore.delete(from);
 
       console.log(`🔑 Token successfully acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Please type your order request again.");
+      await sendWhatsAppMessage(from, "🎉 Authenticated successfully with Swiggy! Re-send your food item order to view options.");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
@@ -242,7 +228,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
     let responseMessage = aiData.choices[0].message;
 
-    // Multi-turn tool execution loop
     while (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
       const toolCall = responseMessage.tool_calls[0];
       console.log(`🛠️ OpenAI requested Swiggy Tool: ${toolCall.function.name}`);
@@ -254,30 +239,34 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
         const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
         const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
 
-        return `🔒 Connect your Swiggy account to fetch addresses & place orders:\n\n1. Open link: ${authUrl}\n2. Sign in to Swiggy.\n3. Copy the address bar URL (starts with http://localhost/callback...) and paste it directly into this chat!`;
+        return `🔒 Connect your Swiggy account to fetch addresses & place orders:\n\n1. Open link: ${authUrl}\n2. Sign in to Swiggy.\n3. Copy the browser URL (starts with http://localhost/callback...) and paste it directly into this chat!`;
       }
 
-      // Execute tool call to Swiggy MCP Server
-      const mcpRes = await fetch('https://mcp.swiggy.com/food', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${userAuthToken}`
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method: 'tools/call',
-          params: {
-            name: toolCall.function.name,
-            arguments: JSON.parse(toolCall.function.arguments || '{}')
-          }
-        })
-      });
+      let toolResult;
+      try {
+        const mcpRes = await fetch('https://mcp.swiggy.com/food', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${userAuthToken}`
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: {
+              name: toolCall.function.name,
+              arguments: JSON.parse(toolCall.function.arguments || '{}')
+            }
+          })
+        });
 
-      const toolResult = await mcpRes.json();
+        toolResult = await mcpRes.json();
+      } catch (mcpErr) {
+        console.error(`❌ MCP Tool Error [${toolCall.function.name}]:`, mcpErr.message);
+        toolResult = { error: `Failed to fetch data from Swiggy: ${mcpErr.message}` };
+      }
 
-      // Pass execution results back to OpenAI
       const followUpRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
