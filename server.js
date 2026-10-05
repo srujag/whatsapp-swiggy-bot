@@ -25,7 +25,7 @@ function generatePKCE() {
 }
 
 /**
- * Corrected Swiggy MCP Tool Definitions (OpenAI Compliant JSON Schema)
+ * Updated Swiggy MCP Tool Definitions
  */
 const SWIGGY_FOOD_TOOLS = [
   {
@@ -36,7 +36,7 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          dummy: { type: 'string', description: 'Optional unused parameter' }
+          dummy: { type: 'string', description: 'Optional parameter' }
         }
       }
     }
@@ -49,7 +49,9 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          address: { type: 'string', description: 'Full address or neighborhood provided by user (e.g., Kondapur, Hyderabad)' }
+          address: { type: 'string', description: 'Full address or street name' },
+          area: { type: 'string', description: 'Area or neighborhood, e.g., Kondapur' },
+          city: { type: 'string', description: 'City name, e.g., Hyderabad' }
         },
         required: ['address']
       }
@@ -59,14 +61,14 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'search_restaurants',
-      description: 'Search Swiggy for restaurants using an addressId.',
+      description: 'Search Swiggy for restaurants using an addressId or general search query.',
       parameters: {
         type: 'object',
         properties: {
           addressId: { type: 'string', description: 'Address ID obtained from get_addresses or create_address' },
           query: { type: 'string', description: 'Restaurant name or cuisine search query' }
         },
-        required: ['addressId', 'query']
+        required: ['query']
       }
     }
   },
@@ -79,9 +81,9 @@ const SWIGGY_FOOD_TOOLS = [
         type: 'object',
         properties: {
           addressId: { type: 'string', description: 'Address ID obtained from get_addresses or create_address' },
-          query: { type: 'string', description: 'Dish name, e.g., chicken biryani' }
+          query: { type: 'string', description: 'Dish name, e.g., chocobar' }
         },
-        required: ['addressId', 'query']
+        required: ['query']
       }
     }
   },
@@ -123,7 +125,7 @@ const SWIGGY_FOOD_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          dummy: { type: 'string', description: 'Optional unused parameter' }
+          dummy: { type: 'string', description: 'Optional parameter' }
         }
       }
     }
@@ -148,12 +150,12 @@ const SWIGGY_FOOD_TOOLS = [
 const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
 
 CRITICAL WORKFLOW RULES:
-1. When a user asks for a dish or restaurant (e.g. "Butterscotch in Kondapur"):
+1. When a user asks for a dish or restaurant (e.g. "chocobar in Kondapur"):
    - Step A: Call \`get_addresses\`.
-   - Step B: If \`get_addresses\` returns an address, pick the first \`addressId\`.
-   - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire an \`addressId\`.
-   - Step D: Once you have an \`addressId\`, call \`search_menu(addressId=..., query="Butterscotch")\` or \`search_restaurants\`.
-   - DO NOT repeatedly ask the user for their location if they already provided an area in previous messages!
+   - Step B: If \`get_addresses\` returns saved addresses, select the first valid \`addressId\`.
+   - Step C: If \`get_addresses\` returns empty or fails:
+     * Call \`create_address\` with \`address\`: "Kondapur, Hyderabad", \`area\`: "Kondapur", \`city\`: "Hyderabad".
+   - Step D: If \`create_address\` fails or returns an error, DO NOT stop or complain about technical difficulties to the user. Instantly bypass the address ID and run \`search_menu(query="chocobar Kondapur")\` or \`search_restaurants(query="chocobar Kondapur")\` directly.
 
 2. Present 3-5 dish options with restaurant name, item name, price (in INR), and rating.
 3. Upon user confirmation:
@@ -161,7 +163,7 @@ CRITICAL WORKFLOW RULES:
    - Request final user confirmation to place order via Cash on Delivery (COD).`;
 
 /**
- * Execute calls to Swiggy MCP Server
+ * Execute JSON-RPC 2.0 calls to Swiggy MCP Server
  */
 async function callSwiggyMCP(toolName, args, token) {
   const headers = {
@@ -190,14 +192,14 @@ async function callSwiggyMCP(toolName, args, token) {
       console.error(`❌ Swiggy MCP Tool [${toolName}] Error:`, mcpData);
       return { 
         status: "error", 
-        message: mcpData?.error?.message || `HTTP ${mcpRes.status} response from Swiggy` 
+        message: mcpData?.error?.message || `HTTP ${mcpRes.status} response from Swiggy API` 
       };
     }
 
     return mcpData.result || mcpData;
   } catch (err) {
     console.error(`❌ Exception in callSwiggyMCP [${toolName}]:`, err.message);
-    return { status: "error", message: `Failed to communicate with Swiggy: ${err.message}` };
+    return { status: "error", message: `Failed to execute Swiggy MCP tool: ${err.message}` };
   }
 }
 
@@ -283,11 +285,10 @@ async function handleUserCodeSubmission(from, input) {
       userTokens.set(from, tokenData.access_token);
       pkceStore.delete(from);
 
-      // Force-reset conversation history so the new chat starts with clean message roles
       conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
 
       console.log(`🔑 Token acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated with Swiggy! Please ask for your dish again (e.g., 'Butterscotch in Kondapur').");
+      await sendWhatsAppMessage(from, "🎉 Authenticated with Swiggy! Please ask for your dish again (e.g., 'Chocobar in Kondapur').");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
@@ -301,7 +302,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return "OpenAI API Key missing.";
 
-  // Pre-Authentication Guard
   if (!userAuthToken) {
     const { verifier, challenge } = generatePKCE();
     pkceStore.set(from, verifier);
@@ -346,7 +346,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
       if (!aiData.choices || aiData.choices.length === 0) {
         console.error('❌ OpenAI Error Payload:', JSON.stringify(aiData));
-        // Reset corrupt state on error
         conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
         return `OpenAI Error: ${aiData.error?.message || "Invalid response format"}`;
       }
