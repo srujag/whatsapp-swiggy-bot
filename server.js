@@ -9,7 +9,7 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:
 
 const userTokens = new Map();
 const pkceStore = new Map();
-// Stores chat history per WhatsApp user ID to maintain context memory
+// In-memory conversation history per WhatsApp user ID
 const conversationHistory = new Map(); 
 
 const SWIGGY_MCP_ENDPOINT = 'https://mcp.swiggy.com/food';
@@ -55,12 +55,27 @@ const SWIGGY_FOOD_TOOLS = [
     type: 'function',
     function: {
       name: 'search_restaurants',
-      description: 'Search Swiggy for restaurants and dishes using an addressId.',
+      description: 'Search Swiggy for restaurants using an addressId.',
       parameters: {
         type: 'object',
         properties: {
-          addressId: { type: 'string', description: 'REQUIRED addressId obtained from get_addresses or create_address' },
-          query: { type: 'string', description: 'Dish or restaurant search query (e.g., chicken biryani)' }
+          addressId: { type: 'string', description: 'Address ID obtained from get_addresses or create_address' },
+          query: { type: 'string', description: 'Restaurant name or cuisine search query' }
+        },
+        required: ['addressId', 'query']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_menu',
+      description: 'Search Swiggy for specific food items and dishes across restaurant menus.',
+      parameters: {
+        type: 'object',
+        properties: {
+          addressId: { type: 'string', description: 'Address ID obtained from get_addresses or create_address' },
+          query: { type: 'string', description: 'Dish name, e.g., chicken biryani' }
         },
         required: ['addressId', 'query']
       }
@@ -113,7 +128,7 @@ const SWIGGY_FOOD_TOOLS = [
         type: 'object',
         properties: {
           addressId: { type: 'string', description: 'Selected address ID for delivery' },
-          payment_method: { type: 'string', description: 'Set strictly to COD' }
+          payment_method: { type: 'string', description: 'Must be set to COD' }
         },
         required: ['addressId', 'payment_method']
       }
@@ -123,13 +138,13 @@ const SWIGGY_FOOD_TOOLS = [
 
 const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
 
-CRITICAL INSTRUCTIONS TO PREVENT LOCATION LOOPS:
-1. When a user asks for food (e.g. "chicken biryani" in "Kondapur"):
+CRITICAL WORKFLOW RULES:
+1. When a user asks for a dish or restaurant (e.g. "chicken biryani" in "Kondapur"):
    - Step A: Call \`get_addresses\`.
    - Step B: If \`get_addresses\` returns an address, pick the first \`addressId\`.
-   - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire a new \`addressId\`.
-   - Step D: Once you have an \`addressId\`, directly call \`search_restaurants(addressId=..., query="chicken biryani")\`.
-   - DO NOT repeatedly ask the user for their location if they already typed an area in prior messages!
+   - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire an \`addressId\`.
+   - Step D: Once you have an \`addressId\`, call \`search_menu(addressId=..., query="chicken biryani")\` or \`search_restaurants\`.
+   - DO NOT repeatedly ask the user for their location if they already provided an area in previous messages!
 
 2. Present 3-5 dish options with restaurant name, item name, price (in INR), and rating.
 3. Upon user confirmation:
@@ -137,7 +152,7 @@ CRITICAL INSTRUCTIONS TO PREVENT LOCATION LOOPS:
    - Request final user confirmation to place order via Cash on Delivery (COD).`;
 
 /**
- * Execute JSON-RPC 2.0 calls to Swiggy MCP Server with Initialization
+ * Execute JSON-RPC 2.0 calls to Swiggy MCP Server
  */
 async function callSwiggyMCP(toolName, args, token) {
   const headers = {
@@ -215,6 +230,14 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Message from ${from}: "${text}"`);
 
         if (text) {
+          // Manual session reset keyword
+          if (text.toLowerCase().trim() === 'logout') {
+            userTokens.delete(from);
+            conversationHistory.delete(from);
+            await sendWhatsAppMessage(from, "Logged out successfully and session cleared!");
+            return;
+          }
+
           if (text.includes('code=') || text.includes('localhost/callback')) {
             await handleUserCodeSubmission(from, text);
           } else {
@@ -278,7 +301,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return "OpenAI API Key missing.";
 
-  // Retrieve or initialize conversation context history for this user
+  // Initialize context history if not present
   if (!conversationHistory.has(from)) {
     conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
   }
@@ -286,7 +309,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const history = conversationHistory.get(from);
   history.push({ role: 'user', content: userMessage });
 
-  // Limit conversation context history to avoid token overflow
+  // Limit conversation history length
   if (history.length > 12) {
     history.splice(1, history.length - 12);
   }
@@ -314,17 +337,14 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
       if (!aiData.choices || aiData.choices.length === 0) {
         console.error('❌ OpenAI Error:', JSON.stringify(aiData));
-        // Reset corrupt context history on failure
         conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
         return "I encountered an error processing your request. Please try again.";
       }
 
       const responseMessage = aiData.choices[0].message;
 
-      // Check if OpenAI wants to invoke tool calls
       if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
 
-        // If user is not authenticated, request login without corrupting message history
         if (!userAuthToken) {
           const { verifier, challenge } = generatePKCE();
           pkceStore.set(from, verifier);
@@ -332,13 +352,13 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
           const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
           const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
 
-          // Remove unhandled prompt to keep message history synchronized
+          // Remove the unhandled user prompt to keep message history clean
           history.pop();
 
           return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
         }
 
-        // Push assistant tool request to history AFTER verifying auth token exists
+        // Save assistant tool request AFTER verifying token exists
         history.push(responseMessage);
 
         for (const toolCall of responseMessage.tool_calls) {
@@ -349,7 +369,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
           const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
 
-          // Always push matching tool response for every tool_call_id
+          // Always return a matching tool response to OpenAI
           history.push({
             role: 'tool',
             tool_call_id: toolCall.id,
@@ -357,7 +377,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
           });
         }
       } else {
-        // Final text response received
         history.push(responseMessage);
         finalReply = responseMessage.content;
         continueLoop = false;
@@ -367,7 +386,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
     return finalReply;
   } catch (err) {
     console.error('⚠️ Processing error:', err.message);
-    // Reset history to clear bad states on uncaught exceptions
     conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
     return `Error processing request: ${err.message}`;
   }
