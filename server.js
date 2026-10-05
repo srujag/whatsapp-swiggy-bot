@@ -9,7 +9,7 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:
 
 const userTokens = new Map();
 const pkceStore = new Map();
-// In-memory conversation history per WhatsApp user ID
+// Stores chat context per WhatsApp user ID
 const conversationHistory = new Map(); 
 
 const SWIGGY_MCP_ENDPOINT = 'https://mcp.swiggy.com/food';
@@ -230,7 +230,7 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Message from ${from}: "${text}"`);
 
         if (text) {
-          // Manual session reset keyword
+          // Command to reset session manually
           if (text.toLowerCase().trim() === 'logout') {
             userTokens.delete(from);
             conversationHistory.delete(from);
@@ -301,7 +301,18 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return "OpenAI API Key missing.";
 
-  // Initialize context history if not present
+  // 1. If user is NOT authenticated, return OAuth login link directly WITHOUT calling OpenAI
+  if (!userAuthToken) {
+    const { verifier, challenge } = generatePKCE();
+    pkceStore.set(from, verifier);
+
+    const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
+    const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
+
+    return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
+  }
+
+  // 2. Initialize history array for authenticated session
   if (!conversationHistory.has(from)) {
     conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
   }
@@ -336,40 +347,26 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
       const aiData = await openaiRes.json();
 
       if (!aiData.choices || aiData.choices.length === 0) {
-        console.error('❌ OpenAI Error:', JSON.stringify(aiData));
+        console.error('❌ OpenAI Error Response:', JSON.stringify(aiData));
         conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
-        return "I encountered an error processing your request. Please try again.";
+        return "I encountered an error communicating with OpenAI. Please try your message again.";
       }
 
       const responseMessage = aiData.choices[0].message;
 
       if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-
-        if (!userAuthToken) {
-          const { verifier, challenge } = generatePKCE();
-          pkceStore.set(from, verifier);
-
-          const encodedRedirect = encodeURIComponent(SWIGGY_REDIRECT_URI);
-          const authUrl = `https://mcp.swiggy.com/auth/authorize?response_type=code&client_id=whatsapp_bot&redirect_uri=${encodedRedirect}&state=${from}&code_challenge=${challenge}&code_challenge_method=S256`;
-
-          // Remove the unhandled user prompt to keep message history clean
-          history.pop();
-
-          return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
-        }
-
-        // Save assistant tool request AFTER verifying token exists
+        // Save assistant tool request to history
         history.push(responseMessage);
 
+        // Execute each tool call and push corresponding tool response
         for (const toolCall of responseMessage.tool_calls) {
           const toolName = toolCall.function.name;
           const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
 
-          console.log(`🛠️ Calling Tool: ${toolName}`, toolArgs);
+          console.log(`🛠️ Calling Swiggy MCP Tool: ${toolName}`, toolArgs);
 
           const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
 
-          // Always return a matching tool response to OpenAI
           history.push({
             role: 'tool',
             tool_call_id: toolCall.id,
@@ -377,6 +374,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
           });
         }
       } else {
+        // Final assistant text response reached
         history.push(responseMessage);
         finalReply = responseMessage.content;
         continueLoop = false;
@@ -385,7 +383,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
     return finalReply;
   } catch (err) {
-    console.error('⚠️ Processing error:', err.message);
+    console.error('⚠️ Processing loop error:', err.message);
     conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
     return `Error processing request: ${err.message}`;
   }
