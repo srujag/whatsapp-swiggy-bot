@@ -24,13 +24,21 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
+/**
+ * Corrected Swiggy MCP Tool Definitions (OpenAI Compliant JSON Schema)
+ */
 const SWIGGY_FOOD_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'get_addresses',
       description: 'Fetch saved delivery addresses for the logged-in Swiggy user.',
-      parameters: { type: 'object', properties: {} }
+      parameters: {
+        type: 'object',
+        properties: {
+          dummy: { type: 'string', description: 'Optional unused parameter' }
+        }
+      }
     }
   },
   {
@@ -112,7 +120,12 @@ const SWIGGY_FOOD_TOOLS = [
     function: {
       name: 'get_food_cart',
       description: 'Fetch current cart contents, bill breakdown, and delivery charges.',
-      parameters: { type: 'object', properties: {} }
+      parameters: {
+        type: 'object',
+        properties: {
+          dummy: { type: 'string', description: 'Optional unused parameter' }
+        }
+      }
     }
   },
   {
@@ -135,11 +148,11 @@ const SWIGGY_FOOD_TOOLS = [
 const SYSTEM_PROMPT = `You are an active Swiggy ordering assistant on WhatsApp.
 
 CRITICAL WORKFLOW RULES:
-1. When a user asks for a dish or restaurant (e.g. "chicken biryani" in "Kondapur"):
+1. When a user asks for a dish or restaurant (e.g. "Butterscotch in Kondapur"):
    - Step A: Call \`get_addresses\`.
    - Step B: If \`get_addresses\` returns an address, pick the first \`addressId\`.
    - Step C: If \`get_addresses\` returns NO address or fails, and the user provided an area (e.g., "Kondapur"), IMMEDIATELY call \`create_address(address="Kondapur, Hyderabad")\` to acquire an \`addressId\`.
-   - Step D: Once you have an \`addressId\`, call \`search_menu(addressId=..., query="chicken biryani")\` or \`search_restaurants\`.
+   - Step D: Once you have an \`addressId\`, call \`search_menu(addressId=..., query="Butterscotch")\` or \`search_restaurants\`.
    - DO NOT repeatedly ask the user for their location if they already provided an area in previous messages!
 
 2. Present 3-5 dish options with restaurant name, item name, price (in INR), and rating.
@@ -148,7 +161,7 @@ CRITICAL WORKFLOW RULES:
    - Request final user confirmation to place order via Cash on Delivery (COD).`;
 
 /**
- * Robust JSON-RPC Call to Swiggy MCP Server
+ * Execute calls to Swiggy MCP Server
  */
 async function callSwiggyMCP(toolName, args, token) {
   const headers = {
@@ -157,23 +170,6 @@ async function callSwiggyMCP(toolName, args, token) {
   };
 
   try {
-    // 1. Initialize JSON-RPC handshake
-    await fetch(SWIGGY_MCP_ENDPOINT, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-          clientInfo: { name: 'whatsapp-swiggy-bot', version: '1.0.0' }
-        }
-      })
-    }).catch(err => console.warn(`⚠️ Handshake notice: ${err.message}`));
-
-    // 2. Call Tool
     const mcpRes = await fetch(SWIGGY_MCP_ENDPOINT, {
       method: 'POST',
       headers,
@@ -183,7 +179,7 @@ async function callSwiggyMCP(toolName, args, token) {
         method: 'tools/call',
         params: {
           name: toolName,
-          arguments: args
+          arguments: args || {}
         }
       })
     });
@@ -194,14 +190,14 @@ async function callSwiggyMCP(toolName, args, token) {
       console.error(`❌ Swiggy MCP Tool [${toolName}] Error:`, mcpData);
       return { 
         status: "error", 
-        message: mcpData?.error?.message || `HTTP ${mcpRes.status} status from Swiggy API` 
+        message: mcpData?.error?.message || `HTTP ${mcpRes.status} response from Swiggy` 
       };
     }
 
     return mcpData.result || mcpData;
   } catch (err) {
     console.error(`❌ Exception in callSwiggyMCP [${toolName}]:`, err.message);
-    return { status: "error", message: `Failed to reach Swiggy API: ${err.message}` };
+    return { status: "error", message: `Failed to communicate with Swiggy: ${err.message}` };
   }
 }
 
@@ -287,7 +283,7 @@ async function handleUserCodeSubmission(from, input) {
       userTokens.set(from, tokenData.access_token);
       pkceStore.delete(from);
 
-      // Clean conversation history on successful auth
+      // Force-reset conversation history so the new chat starts with clean message roles
       conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
 
       console.log(`🔑 Token acquired for ${from}`);
@@ -305,6 +301,7 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return "OpenAI API Key missing.";
 
+  // Pre-Authentication Guard
   if (!userAuthToken) {
     const { verifier, challenge } = generatePKCE();
     pkceStore.set(from, verifier);
@@ -348,9 +345,10 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
       const aiData = await openaiRes.json();
 
       if (!aiData.choices || aiData.choices.length === 0) {
-        console.error('❌ OpenAI Error Response:', JSON.stringify(aiData));
+        console.error('❌ OpenAI Error Payload:', JSON.stringify(aiData));
+        // Reset corrupt state on error
         conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
-        return "I encountered an error communicating with OpenAI. Please try your message again.";
+        return `OpenAI Error: ${aiData.error?.message || "Invalid response format"}`;
       }
 
       const responseMessage = aiData.choices[0].message;
@@ -364,7 +362,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
 
           console.log(`🛠️ Calling Swiggy MCP Tool: ${toolName}`, toolArgs);
 
-          // Safe execution with error handling inside callSwiggyMCP
           const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
 
           history.push({
