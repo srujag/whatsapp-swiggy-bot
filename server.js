@@ -9,7 +9,6 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:
 
 const userTokens = new Map();
 const pkceStore = new Map();
-// Stores chat context per WhatsApp user ID
 const conversationHistory = new Map(); 
 
 const SWIGGY_MCP_ENDPOINT = 'https://mcp.swiggy.com/food';
@@ -25,9 +24,6 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
-/**
- * Official Swiggy MCP Tool Definitions
- */
 const SWIGGY_FOOD_TOOLS = [
   {
     type: 'function',
@@ -152,7 +148,7 @@ CRITICAL WORKFLOW RULES:
    - Request final user confirmation to place order via Cash on Delivery (COD).`;
 
 /**
- * Execute JSON-RPC 2.0 calls to Swiggy MCP Server
+ * Robust JSON-RPC Call to Swiggy MCP Server
  */
 async function callSwiggyMCP(toolName, args, token) {
   const headers = {
@@ -161,6 +157,7 @@ async function callSwiggyMCP(toolName, args, token) {
   };
 
   try {
+    // 1. Initialize JSON-RPC handshake
     await fetch(SWIGGY_MCP_ENDPOINT, {
       method: 'POST',
       headers,
@@ -174,33 +171,38 @@ async function callSwiggyMCP(toolName, args, token) {
           clientInfo: { name: 'whatsapp-swiggy-bot', version: '1.0.0' }
         }
       })
+    }).catch(err => console.warn(`⚠️ Handshake notice: ${err.message}`));
+
+    // 2. Call Tool
+    const mcpRes = await fetch(SWIGGY_MCP_ENDPOINT, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: args
+        }
+      })
     });
+
+    const mcpData = await mcpRes.json().catch(() => null);
+
+    if (!mcpRes.ok || !mcpData || mcpData.error) {
+      console.error(`❌ Swiggy MCP Tool [${toolName}] Error:`, mcpData);
+      return { 
+        status: "error", 
+        message: mcpData?.error?.message || `HTTP ${mcpRes.status} status from Swiggy API` 
+      };
+    }
+
+    return mcpData.result || mcpData;
   } catch (err) {
-    console.warn(`⚠️ MCP initialize handshake warning: ${err.message}`);
+    console.error(`❌ Exception in callSwiggyMCP [${toolName}]:`, err.message);
+    return { status: "error", message: `Failed to reach Swiggy API: ${err.message}` };
   }
-
-  const mcpRes = await fetch(SWIGGY_MCP_ENDPOINT, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'tools/call',
-      params: {
-        name: toolName,
-        arguments: args
-      }
-    })
-  });
-
-  const mcpData = await mcpRes.json();
-
-  if (!mcpRes.ok || mcpData.error) {
-    console.error(`❌ MCP Tool Call Failed [${toolName}]:`, JSON.stringify(mcpData));
-    return { success: false, error: mcpData.error?.message || `Error status ${mcpRes.status}` };
-  }
-
-  return mcpData.result || mcpData;
 }
 
 app.get('/webhook', (req, res) => {
@@ -230,7 +232,6 @@ app.post('/webhook', async (req, res) => {
         console.log(`📩 Message from ${from}: "${text}"`);
 
         if (text) {
-          // Command to reset session manually
           if (text.toLowerCase().trim() === 'logout') {
             userTokens.delete(from);
             conversationHistory.delete(from);
@@ -286,14 +287,17 @@ async function handleUserCodeSubmission(from, input) {
       userTokens.set(from, tokenData.access_token);
       pkceStore.delete(from);
 
+      // Clean conversation history on successful auth
+      conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
+
       console.log(`🔑 Token acquired for ${from}`);
-      await sendWhatsAppMessage(from, "🎉 Authenticated with Swiggy! Please ask for your dish again (e.g., 'Chicken Biryani in Kondapur').");
+      await sendWhatsAppMessage(from, "🎉 Authenticated with Swiggy! Please ask for your dish again (e.g., 'Butterscotch in Kondapur').");
     } else {
       throw new Error(tokenData.error_description || 'Token exchange failed.');
     }
   } catch (err) {
     console.error('❌ OAuth Exchange Error:', err.message);
-    await sendWhatsAppMessage(from, `❌ Authentication error: ${err.message}. Please copy and paste the entire browser URL again.`);
+    await sendWhatsAppMessage(from, `❌ Authentication error: ${err.message}. Please copy and paste the browser URL again.`);
   }
 }
 
@@ -301,7 +305,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return "OpenAI API Key missing.";
 
-  // 1. If user is NOT authenticated, return OAuth login link directly WITHOUT calling OpenAI
   if (!userAuthToken) {
     const { verifier, challenge } = generatePKCE();
     pkceStore.set(from, verifier);
@@ -312,7 +315,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
     return `🔒 Swiggy Login Required:\n\n1. Open link: ${authUrl}\n2. Login to Swiggy.\n3. Copy the browser URL (http://localhost/callback...) and paste it here!`;
   }
 
-  // 2. Initialize history array for authenticated session
   if (!conversationHistory.has(from)) {
     conversationHistory.set(from, [{ role: 'system', content: SYSTEM_PROMPT }]);
   }
@@ -320,7 +322,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
   const history = conversationHistory.get(from);
   history.push({ role: 'user', content: userMessage });
 
-  // Limit conversation history length
   if (history.length > 12) {
     history.splice(1, history.length - 12);
   }
@@ -355,16 +356,15 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
       const responseMessage = aiData.choices[0].message;
 
       if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-        // Save assistant tool request to history
         history.push(responseMessage);
 
-        // Execute each tool call and push corresponding tool response
         for (const toolCall of responseMessage.tool_calls) {
           const toolName = toolCall.function.name;
           const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
 
           console.log(`🛠️ Calling Swiggy MCP Tool: ${toolName}`, toolArgs);
 
+          // Safe execution with error handling inside callSwiggyMCP
           const toolResult = await callSwiggyMCP(toolName, toolArgs, userAuthToken);
 
           history.push({
@@ -374,7 +374,6 @@ async function processWithOpenAIAndSwiggy(from, userMessage, userAuthToken = nul
           });
         }
       } else {
-        // Final assistant text response reached
         history.push(responseMessage);
         finalReply = responseMessage.content;
         continueLoop = false;
